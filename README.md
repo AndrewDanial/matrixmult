@@ -2,7 +2,7 @@
 
 A commandline tool to quickly multiply two matrices
 
-#USAGE:
+# USAGE:
 
 1) Git clone and CD into the project directory
 2) Run the command `cargo run`
