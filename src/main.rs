@@ -10,25 +10,35 @@
 ///   * Pressing Enter pushes the current input in the history of previous
 ///   messages
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::{error::Error, io};
+use std::{
+    error::Error,
+    io,
+    sync::{
+        mpsc::{self, Receiver},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 use tui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Span, Spans, Text},
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::Span,
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 
 type Matrix = Vec<Vec<i64>>;
 
-enum InputMode {
-    Normal,
-    Editing,
+// the name event was taken :(
+enum Ev<I> {
+    Input(I),
+    Tick,
 }
 
 /// App holds the state of the application
@@ -60,6 +70,32 @@ impl App {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let (tx, rx) = mpsc::channel(); // create mpsc channel to handle inputs in separate thread
+    let tick_rate = Duration::from_millis(1000); // wait 1000 ms for event
+    thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        loop {
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0)); // set timeout to tick_rate - (time since last_tick)
+
+            // if we got an event
+            if event::poll(timeout).unwrap() {
+                // if the event is a keypress
+                if let Event::Key(key) = event::read().unwrap() {
+                    tx.send(Ev::Input(key)).unwrap();
+                }
+            }
+
+            // if more than tick_rate time has passed since last_tick was created
+            if last_tick.elapsed() >= tick_rate {
+                if let Ok(_) = tx.send(Ev::Tick) {
+                    last_tick = Instant::now(); // reset last tick
+                }
+            }
+        }
+    });
+
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -70,7 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     terminal.hide_cursor()?;
     // create app and run it
     let app = App::default();
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, app, rx);
 
     // restore terminal
     disable_raw_mode()?;
@@ -88,12 +124,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    rx: Receiver<Ev<KeyEvent>>,
+) -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
-        match event::read()? {
-            Event::Key(key) => match key.code {
+        match rx.recv().unwrap() {
+            Ev::Input(key) => match key.code {
                 KeyCode::Tab => {
                     app.next();
                 }
@@ -101,9 +141,13 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     return Ok(());
                 }
                 KeyCode::Char(c) => match c {
-                    '0'..='9' | ' ' => {
+                    '0'..='9' => {
                         app.matrix_text[app.curr_matrix as usize].push(c);
                         app.curr_string.push(c);
+                    }
+                    ' ' => {
+                        app.matrix_text[app.curr_matrix as usize].push('_');
+                        app.curr_string.push('_');
                     }
                     't' => {
                         parse_matrices(&mut app);
@@ -121,7 +165,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 }
                 _ => {}
             },
-            _ => {}
+            Ev::Tick => {}
         }
     }
 }
@@ -257,17 +301,68 @@ fn multiply_matrices(m1: &Matrix, m2: &Matrix) -> Matrix {
     result
 }
 
+fn multiply_matrices_threaded(m1: &Matrix, m2: &Matrix, thread_count: usize) -> Matrix {
+    let mut threads = vec![];
+    let (tx, rx) = mpsc::channel();
+
+    let m1 = Arc::new(m1.clone());
+    let m2 = Arc::new(m2.clone());
+
+    for th in 0..thread_count {
+        let tx = tx.clone();
+        let m1 = Arc::new(m1.clone());
+        let m2 = Arc::new(m2.clone());
+        threads.push(thread::spawn(move || {
+            println!("thread {} started", th);
+
+            let mut curr_result = vec![vec![]; m1.len()];
+            let start_row = (th * m1.len()) / thread_count;
+            let end_row = ((th + 1) * m1.len()) / thread_count;
+            // rows of the first matrix
+            if start_row == end_row {
+                return;
+            }
+            for i in start_row..end_row {
+                // columns of the second matrix
+                for j in 0..m2[0].len() {
+                    // rows of the second matrix
+                    let mut cur = 0;
+                    for k in 0..m2.len() {
+                        cur += m1[i][k] * m2[k][j]
+                    }
+                    curr_result[i].push(cur);
+                }
+            }
+            tx.send((start_row, end_row, curr_result)).unwrap();
+        }));
+    }
+
+    for i in threads {
+        i.join().unwrap();
+    }
+
+    let mut result = vec![vec![]; m1.len()];
+    for j in rx.iter().take(thread_count / 2) {
+        let (start, end, m) = j;
+        for i in start..end {
+            result[i].extend(&m[i]);
+        }
+    }
+
+    result
+}
+
 fn parse_matrices(app: &mut App) {
     let mut a = app.matrix_text[0].split("\n").collect::<Vec<_>>();
     let mut m1 = vec![vec![]; a.len()];
     for i in 0..a.len() {
-        m1[i] = a[i].split(" ").collect::<Vec<&str>>();
+        m1[i] = a[i].split("_").collect::<Vec<&str>>();
     }
 
     a = app.matrix_text[1].split("\n").collect::<Vec<_>>();
     let mut m2 = vec![vec![]; a.len()];
     for i in 0..a.len() {
-        m2[i] = a[i].split(" ").collect::<Vec<&str>>();
+        m2[i] = a[i].split("_").collect::<Vec<&str>>();
     }
 
     let m1: Matrix = m1
